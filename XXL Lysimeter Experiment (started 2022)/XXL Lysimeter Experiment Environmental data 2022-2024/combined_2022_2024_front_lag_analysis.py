@@ -51,6 +51,7 @@ MOISTURE_FILE = "Soil Moisture at 30 cm 2022-2024 (weekly).xlsx"
 MOISTURE60_FILE = "Soil Moisture at 60 cm 2022-2024 (weekly).xlsx"
 
 SELECTED_SENSOR = None
+MOISTURE_AGGREGATION = "median"  # Use "mean" or "median" when SELECTED_SENSOR is None.
 
 SELECTED_TREATMENTS = ["0.0", "1.0", "2.0", "4.0", "5.0", "6.0", "8.0", "9.0"]
 RAIN_EVENT_THRESHOLD_MM = 10.0
@@ -111,6 +112,13 @@ def simplify_sensor_name(col):
     name = col.strip().replace("EC.30.", "").replace("EC.60.", "")
     return name.split("(")[0].strip()
 
+def aggregate_moisture_sensors(df, method):
+    if method == "mean":
+        return df.mean(axis=1, skipna=True)
+    if method == "median":
+        return df.median(axis=1, skipna=True)
+    raise ValueError(f"MOISTURE_AGGREGATION must be 'mean' or 'median', not {method!r}.")
+
 rain_path = os.path.join(DATA_DIR, RAIN_FILE)
 moisture_path = os.path.join(DATA_DIR, MOISTURE_FILE)
 moisture60_path = os.path.join(DATA_DIR, MOISTURE60_FILE)
@@ -136,9 +144,9 @@ if SELECTED_SENSOR is not None and SELECTED_SENSOR not in sensor_map60:
     raise ValueError(f"SELECTED_SENSOR={SELECTED_SENSOR} not found in 60 cm sensors.")
 
 if SELECTED_SENSOR is None:
-    theta_series = moisture.mean(axis=1, skipna=True).rename("theta30_mean")
-    theta60_series = moisture60.mean(axis=1, skipna=True).rename("theta60_mean")
-    sensor_label = "mean_all_sensors"
+    theta_series = aggregate_moisture_sensors(moisture, MOISTURE_AGGREGATION).rename(f"theta30_{MOISTURE_AGGREGATION}")
+    theta60_series = aggregate_moisture_sensors(moisture60, MOISTURE_AGGREGATION).rename(f"theta60_{MOISTURE_AGGREGATION}")
+    sensor_label = f"{MOISTURE_AGGREGATION}_all_sensors"
 else:
     theta_series = moisture[sensor_map[SELECTED_SENSOR]].rename("theta30")
     theta60_series = moisture60[sensor_map60[SELECTED_SENSOR]].rename("theta60")
@@ -147,6 +155,13 @@ else:
 rain_weekly = rain.resample("7D").sum()
 theta_weekly = theta_series.resample("7D").mean().interpolate(limit=2)
 theta60_weekly = theta60_series.resample("7D").mean().interpolate(limit=2)
+
+if SELECTED_SENSOR is None:
+    theta_weekly_std = moisture.resample("7D").mean().std(axis=1, skipna=True).interpolate(limit=2)
+    theta60_weekly_std = moisture60.resample("7D").mean().std(axis=1, skipna=True).interpolate(limit=2)
+else:
+    theta_weekly_std = None
+    theta60_weekly_std = None
 
 leachate = leachate.dropna(subset=["Treatment"])
 leachate_selected = leachate[leachate["Treatment"].isin(SELECTED_TREATMENTS)].copy()
@@ -159,13 +174,44 @@ chem_daily = leachate_selected.groupby(["date", "Treatment"], as_index=False)[ch
 
 fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True, dpi=120, gridspec_kw={"height_ratios": [0.8, 1.0, 1.5, 1.8], "hspace": 0.0})
 
+for ax, label in zip(axes, ["(a)", "(b)", "(c)", "(d)"]):
+    ax.text(
+        0.012, 0.90, label,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 1.5},
+    )
+
 axes[0].bar(rain_weekly.index, rain_weekly["rain"], width=5.5, color="0.25")
 axes[0].set_ylabel(r"Rain" + "\n" + r"[mm wk$^{-1}$]")
 axes[0].set_title("Precipitation, soil moisture, and leachate chemistry, 2022--2024", fontsize=14, pad=8)
 axes[0].grid(axis="y", alpha=0.2)
 
-axes[1].plot(theta_weekly.index, theta_weekly, color="#0072B2", lw=1.8, label="30 cm")
-axes[1].plot(theta60_weekly.index, theta60_weekly, color="#D55E00", lw=1.8, label="60 cm")
+if theta_weekly_std is not None:
+    axes[1].fill_between(
+        theta_weekly.index,
+        (theta_weekly - theta_weekly_std).to_numpy(),
+        (theta_weekly + theta_weekly_std).to_numpy(),
+        color="#0072B2",
+        alpha=0.16,
+        linewidth=0,
+        label="30 cm +/- 1 SD",
+    )
+    axes[1].fill_between(
+        theta60_weekly.index,
+        (theta60_weekly - theta60_weekly_std).to_numpy(),
+        (theta60_weekly + theta60_weekly_std).to_numpy(),
+        color="#D55E00",
+        alpha=0.16,
+        linewidth=0,
+        label="60 cm +/- 1 SD",
+    )
+
+axes[1].plot(theta_weekly.index, theta_weekly, color="#0072B2", lw=1.8, label=f"30 cm {MOISTURE_AGGREGATION}")
+axes[1].plot(theta60_weekly.index, theta60_weekly, color="#D55E00", lw=1.8, label=f"60 cm {MOISTURE_AGGREGATION}")
 axes[1].set_ylabel("Soil moisture\n[%]")
 axes[1].legend(loc="upper right", frameon=True, fontsize=8)
 axes[1].grid(axis="y", alpha=0.2)
@@ -228,6 +274,13 @@ MAX_LAG_DAYS = 21
 RAIN_RESPONSE_WINDOW_HOURS = 24
 MOISTURE_RESPONSE_WINDOW_HOURS = 24
 MAX_MOISTURE_INTERPOLATION_GAP_HOURS = 24
+EVENT_DRY_GAP_HOURS = 24
+EVENT_BASELINE_WINDOW_HOURS = 24
+EVENT_SEARCH_WINDOW_DAYS = 14
+EVENT_MIN_RESPONSE_PCT = 0.5
+EVENT_NOISE_MULTIPLIER = 3.0
+CHEMICAL_BASELINE_WINDOW_DAYS = 45
+CHEMICAL_THRESHOLD_ROBUST_SIGMA = 2.0
 
 def read_high_res_export_files(files):
     frames = []
@@ -251,7 +304,7 @@ def clean_high_res_moisture(df, selected_sensor=None):
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
     if selected_sensor is None:
-        theta = out.set_index("Timestamp")[sensor_cols].mean(axis=1, skipna=True)
+        theta = aggregate_moisture_sensors(out.set_index("Timestamp")[sensor_cols], MOISTURE_AGGREGATION)
     else:
         local_sensor_map = {simplify_sensor_name(c): c for c in sensor_cols}
         if selected_sensor not in local_sensor_map:
@@ -260,6 +313,32 @@ def clean_high_res_moisture(df, selected_sensor=None):
 
     theta = theta.groupby(theta.index).mean().sort_index()
     return theta.loc[START_DATE:END_DATE]
+
+def clean_high_res_moisture_matrix(df):
+    out = df.copy()
+    sensor_cols = [c for c in out.columns if c not in ["Timestamp", "Entity Name"]]
+    for col in sensor_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    theta = out.set_index("Timestamp")[sensor_cols].copy()
+    theta.columns = [simplify_sensor_name(c) for c in sensor_cols]
+    theta = theta.groupby(theta.index).mean().sort_index()
+    return theta.loc[START_DATE:END_DATE]
+
+def treatment_from_moisture_sensor(sensor_name):
+    if "." not in sensor_name:
+        return sensor_name
+    return sensor_name.rsplit(".", 1)[0]
+
+def aggregate_moisture_by_treatment(theta_matrix, method):
+    treatment_map = {}
+    for col in theta_matrix.columns:
+        treatment_map.setdefault(treatment_from_moisture_sensor(col), []).append(col)
+
+    treatment_series = {}
+    for treatment, cols in sorted(treatment_map.items()):
+        treatment_series[treatment] = aggregate_moisture_sensors(theta_matrix[cols], method)
+
+    return pd.DataFrame(treatment_series).sort_index()
 
 def regularize_rain_amounts(rain, time_grid, time_step):
     # Rain is an interval amount, so preserve mass by summing into bins.
@@ -307,11 +386,242 @@ def lagged_correlation(driver, response, max_lag_days, time_step_hours):
 
     return lag_days, np.array(corrs), np.array(sample_sizes)
 
-def best_positive_lag(lag_days, corrs, sample_sizes):
-    if np.all(np.isnan(corrs)):
+def best_positive_lag(lag_days, corrs, sample_sizes, min_lag_days=0.0):
+    valid = lag_days >= min_lag_days
+    masked_corrs = np.where(valid, corrs, np.nan)
+    if np.all(np.isnan(masked_corrs)):
         return np.nan, np.nan, 0
-    i = np.nanargmax(corrs)
-    return lag_days[i], corrs[i], sample_sizes[i]
+    i = np.nanargmax(masked_corrs)
+    return lag_days[i], masked_corrs[i], sample_sizes[i]
+
+def detect_rain_events(rain_amounts, minimum_total_mm, dry_gap_hours):
+    wet = rain_amounts[rain_amounts > 0].dropna()
+    columns = [
+        "event_id",
+        "rain_start",
+        "rain_end",
+        "rain_peak_time",
+        "rain_centroid_time",
+        "rain_total_mm",
+        "rain_peak_6h_mm",
+    ]
+    if wet.empty:
+        return pd.DataFrame(columns=columns)
+
+    dry_gap = pd.Timedelta(hours=dry_gap_hours)
+    raw_events = []
+    event_start = wet.index[0]
+    event_end = wet.index[0]
+
+    for timestamp in wet.index[1:]:
+        if timestamp - event_end <= dry_gap:
+            event_end = timestamp
+        else:
+            raw_events.append((event_start, event_end))
+            event_start = timestamp
+            event_end = timestamp
+
+    raw_events.append((event_start, event_end))
+
+    event_rows = []
+    for start, end in raw_events:
+        event_rain = rain_amounts.loc[start:end]
+        total = event_rain.sum()
+        if total < minimum_total_mm:
+            continue
+
+        positive_event_rain = event_rain[event_rain > 0]
+        peak_time = positive_event_rain.idxmax()
+        weights = positive_event_rain.to_numpy(dtype=float)
+        centroid_ns = np.average(positive_event_rain.index.astype("int64"), weights=weights)
+        event_rows.append({
+            "event_id": len(event_rows) + 1,
+            "rain_start": start,
+            "rain_end": end,
+            "rain_peak_time": peak_time,
+            "rain_centroid_time": pd.to_datetime(centroid_ns),
+            "rain_total_mm": total,
+            "rain_peak_6h_mm": positive_event_rain.max(),
+        })
+
+    return pd.DataFrame(event_rows, columns=columns)
+
+def days_between(later, earlier):
+    if pd.isna(later) or pd.isna(earlier):
+        return np.nan
+    return (later - earlier).total_seconds() / 86400
+
+def calculate_event_lags(events, theta_by_depth, time_step_hours):
+    columns = [
+        "event_id",
+        "rain_start",
+        "rain_end",
+        "rain_peak_time",
+        "rain_centroid_time",
+        "rain_total_mm",
+        "rain_peak_6h_mm",
+        "treatment",
+        "depth",
+        "baseline_theta_pct",
+        "response_threshold_pct",
+        "first_response_time",
+        "peak_wetting_time",
+        "peak_theta_time",
+        "first_response_lag_days_from_start",
+        "first_response_lag_days_from_peak",
+        "peak_wetting_lag_days_from_start",
+        "peak_wetting_lag_days_from_peak",
+        "peak_theta_lag_days_from_start",
+        "peak_delta_theta_pct",
+        "peak_wetting_rate_pct_per_6h",
+        "response_class",
+        "search_window_end",
+    ]
+    if events.empty:
+        return pd.DataFrame(columns=columns)
+
+    smooth_steps = rolling_steps(MOISTURE_RESPONSE_WINDOW_HOURS, time_step_hours)
+    baseline_window = pd.Timedelta(hours=EVENT_BASELINE_WINDOW_HOURS)
+    maximum_search_window = pd.Timedelta(days=EVENT_SEARCH_WINDOW_DAYS)
+    all_treatments = sorted(set.intersection(*(set(df.columns) for df in theta_by_depth.values())))
+    rows = []
+
+    for event_index, event in events.reset_index(drop=True).iterrows():
+        rain_start = event["rain_start"]
+        rain_peak = event["rain_peak_time"]
+        next_start = (
+            events.iloc[event_index + 1]["rain_start"]
+            if event_index + 1 < len(events)
+            else rain_start + maximum_search_window
+        )
+        search_window_end = min(rain_start + maximum_search_window, next_start)
+
+        for treatment in all_treatments:
+            for depth, theta_matrix in theta_by_depth.items():
+                theta = theta_matrix[treatment].rolling(
+                    smooth_steps,
+                    min_periods=max(1, smooth_steps // 2),
+                ).mean()
+                baseline = theta.loc[(theta.index >= rain_start - baseline_window) & (theta.index < rain_start)].dropna()
+                response_window = theta.loc[(theta.index >= rain_start) & (theta.index <= search_window_end)].dropna()
+
+                if baseline.empty or response_window.empty:
+                    continue
+
+                baseline_theta = baseline.median()
+                baseline_noise = baseline.std(skipna=True)
+                if pd.isna(baseline_noise):
+                    baseline_noise = 0.0
+                response_threshold = max(EVENT_MIN_RESPONSE_PCT, EVENT_NOISE_MULTIPLIER * baseline_noise)
+                delta_theta = response_window - baseline_theta
+
+                threshold_hits = delta_theta[delta_theta >= response_threshold]
+                first_response_time = pd.NaT if threshold_hits.empty else threshold_hits.index[0]
+                wetting_rate = response_window.diff()
+                peak_wetting_time = pd.NaT if wetting_rate.dropna().empty else wetting_rate.idxmax()
+                peak_theta_time = pd.NaT if delta_theta.dropna().empty else delta_theta.idxmax()
+                peak_delta_theta = delta_theta.max(skipna=True)
+                peak_wetting_rate = wetting_rate.max(skipna=True)
+
+                rows.append({
+                    "event_id": event["event_id"],
+                    "rain_start": rain_start,
+                    "rain_end": event["rain_end"],
+                    "rain_peak_time": rain_peak,
+                    "rain_centroid_time": event["rain_centroid_time"],
+                    "rain_total_mm": event["rain_total_mm"],
+                    "rain_peak_6h_mm": event["rain_peak_6h_mm"],
+                    "treatment": treatment,
+                    "depth": depth,
+                    "baseline_theta_pct": baseline_theta,
+                    "response_threshold_pct": response_threshold,
+                    "first_response_time": first_response_time,
+                    "peak_wetting_time": peak_wetting_time,
+                    "peak_theta_time": peak_theta_time,
+                    "first_response_lag_days_from_start": days_between(first_response_time, rain_start),
+                    "first_response_lag_days_from_peak": days_between(first_response_time, rain_peak),
+                    "peak_wetting_lag_days_from_start": days_between(peak_wetting_time, rain_start),
+                    "peak_wetting_lag_days_from_peak": days_between(peak_wetting_time, rain_peak),
+                    "peak_theta_lag_days_from_start": days_between(peak_theta_time, rain_start),
+                    "peak_delta_theta_pct": peak_delta_theta,
+                    "peak_wetting_rate_pct_per_6h": peak_wetting_rate,
+                    "response_class": (
+                        "threshold response"
+                        if pd.notna(first_response_time)
+                        else "no threshold response before next event/window end"
+                    ),
+                    "search_window_end": search_window_end,
+                })
+
+    return pd.DataFrame(rows, columns=columns)
+
+def summarize_event_lags(event_lags):
+    responding = event_lags[event_lags["response_class"] == "threshold response"].copy()
+    treatment_summary_columns = [
+        "treatment",
+        "depth",
+        "eligible_events",
+        "responding_events",
+        "response_fraction",
+        "median_first_response_lag_days",
+        "q25_first_response_lag_days",
+        "q75_first_response_lag_days",
+        "median_peak_wetting_lag_days",
+        "median_peak_theta_lag_days",
+        "median_peak_delta_theta_pct",
+    ]
+    event_summary_columns = [
+        "event_id",
+        "rain_start",
+        "rain_end",
+        "rain_total_mm",
+        "depth",
+        "n_treatments",
+        "median_first_response_lag_days",
+        "median_peak_wetting_lag_days",
+        "median_peak_theta_lag_days",
+        "median_peak_delta_theta_pct",
+    ]
+    eligible_counts = (
+        event_lags.groupby(["treatment", "depth"], as_index=False)
+        .agg(eligible_events=("event_id", "nunique"))
+    )
+
+    if responding.empty:
+        return eligible_counts.reindex(columns=treatment_summary_columns), pd.DataFrame(columns=event_summary_columns)
+
+    treatment_summary = (
+        responding.groupby(["treatment", "depth"], as_index=False)
+        .agg(
+            responding_events=("event_id", "nunique"),
+            median_first_response_lag_days=("first_response_lag_days_from_start", "median"),
+            q25_first_response_lag_days=("first_response_lag_days_from_start", lambda x: x.quantile(0.25)),
+            q75_first_response_lag_days=("first_response_lag_days_from_start", lambda x: x.quantile(0.75)),
+            median_peak_wetting_lag_days=("peak_wetting_lag_days_from_start", "median"),
+            median_peak_theta_lag_days=("peak_theta_lag_days_from_start", "median"),
+            median_peak_delta_theta_pct=("peak_delta_theta_pct", "median"),
+        )
+    )
+    treatment_summary = eligible_counts.merge(treatment_summary, on=["treatment", "depth"], how="left")
+    treatment_summary["responding_events"] = treatment_summary["responding_events"].fillna(0).astype(int)
+    treatment_summary["response_fraction"] = (
+        treatment_summary["responding_events"] / treatment_summary["eligible_events"]
+    )
+    treatment_summary = treatment_summary[treatment_summary_columns].sort_values(["treatment", "depth"])
+
+    event_summary = (
+        responding.groupby(["event_id", "rain_start", "rain_end", "rain_total_mm", "depth"], as_index=False)
+        .agg(
+            n_treatments=("treatment", "nunique"),
+            median_first_response_lag_days=("first_response_lag_days_from_start", "median"),
+            median_peak_wetting_lag_days=("peak_wetting_lag_days_from_start", "median"),
+            median_peak_theta_lag_days=("peak_theta_lag_days_from_start", "median"),
+            median_peak_delta_theta_pct=("peak_delta_theta_pct", "median"),
+        )
+        .sort_values(["event_id", "depth"])
+    )
+
+    return treatment_summary, event_summary
 
 rain_high_res = clean_high_res_rain(read_high_res_export_files(HIGH_RES_RAIN_FILES))
 theta30_high_res = clean_high_res_moisture(read_high_res_export_files(HIGH_RES_MOISTURE30_FILES), SELECTED_SENSOR)
@@ -343,27 +653,311 @@ lag30_days, corr30, n30 = lagged_correlation(rain_signal, theta30_response, MAX_
 lag60_days, corr60, n60 = lagged_correlation(rain_signal, theta60_response, MAX_LAG_DAYS, time_step_hours)
 lag3060_days, corr3060, n3060 = lagged_correlation(theta3060_driver, theta60_response, MAX_LAG_DAYS, time_step_hours)
 
-best30, bestcorr30, bestn30 = best_positive_lag(lag30_days, corr30, n30)
-best60, bestcorr60, bestn60 = best_positive_lag(lag60_days, corr60, n60)
-best3060, bestcorr3060, bestn3060 = best_positive_lag(lag3060_days, corr3060, n3060)
+minimum_resolvable_lag_days = time_step_hours / 24
+
+best30, bestcorr30, bestn30 = best_positive_lag(lag30_days, corr30, n30, minimum_resolvable_lag_days)
+direct_best60, direct_bestcorr60, direct_bestn60 = best_positive_lag(lag60_days, corr60, n60, minimum_resolvable_lag_days)
+best3060, bestcorr3060, bestn3060 = best_positive_lag(lag3060_days, corr3060, n3060, minimum_resolvable_lag_days)
+
+if np.isnan(best30) or np.isnan(best3060):
+    best60 = direct_best60
+else:
+    best60 = best30 + best3060
 
 hydrologic_lags = pd.DataFrame({
+    "moisture_aggregation": [sensor_label] * 3,
     "process": ["Rain to 30 cm wetting response", "Rain to 60 cm wetting response", "30 to 60 cm wetting response"],
     "lag_days": [best30, best60, best3060],
-    "max_correlation": [bestcorr30, bestcorr60, bestcorr3060],
-    "n_pairs": [bestn30, bestn60, bestn3060],
-    "method": ["mass-conserving rain, positive theta change"] * 3,
+    "max_correlation": [bestcorr30, direct_bestcorr60, bestcorr3060],
+    "direct_lag_days": [best30, direct_best60, best3060],
+    "direct_max_correlation": [bestcorr30, direct_bestcorr60, bestcorr3060],
+    "n_pairs": [bestn30, direct_bestn60, bestn3060],
+    "minimum_resolvable_lag_days": [minimum_resolvable_lag_days] * 3,
+    "method": [
+        "mass-conserving rain, positive theta change, zero-lag excluded",
+        "sequential sum of rain-to-30 and 30-to-60; direct rain-to-60 retained as diagnostic",
+        "positive theta change, zero-lag excluded",
+    ],
 })
 
 hydrologic_lags.to_csv(os.path.join(FIG_DIR, "high_resolution_hydrologic_lags.csv"), index=False)
 
+hydro_lag_plot = hydrologic_lags.copy()
+hydro_lag_plot["plot_label"] = [
+    "Rain to\n30 cm",
+    "Rain to\n60 cm",
+    "30 to\n60 cm",
+]
+
+hydro_colors = ["#0072B2", "#D55E00", "#009E73"]  # Okabe-Ito blue, vermillion, green.
+hydro_hatches = ["///", "\\\\\\", "xx"]
+
+fig, ax = plt.subplots(figsize=(5.9, 4.1), dpi=150)
+bars = ax.bar(
+    hydro_lag_plot["plot_label"],
+    hydro_lag_plot["lag_days"],
+    color=hydro_colors,
+    edgecolor="black",
+    linewidth=0.9,
+)
+
+for bar, hatch, lag in zip(bars, hydro_hatches, hydro_lag_plot["lag_days"]):
+    bar.set_hatch(hatch)
+    if pd.notna(lag):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            lag + max(0.02, 0.04 * hydro_lag_plot["lag_days"].max()),
+            f"{lag:.2g} d",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+
+ax.axhline(
+    minimum_resolvable_lag_days,
+    color="0.25",
+    lw=0.9,
+    ls=":",
+    label=f"Resolution = {minimum_resolvable_lag_days:.2g} d",
+)
+ax.set_ylabel("Lag time [days]")
+ax.set_title("Hydrologic wetting-response lag times")
+ax.set_ylim(0, max(0.75, 1.35 * hydro_lag_plot["lag_days"].max()))
+ax.grid(axis="y", alpha=0.25)
+ax.legend(frameon=False, loc="upper left")
+plt.tight_layout()
+save_figure(fig, "high_resolution_hydrologic_lag_times_accessible")
+plt.show()
+
+theta30_treatment_high_res = aggregate_moisture_by_treatment(
+    clean_high_res_moisture_matrix(read_high_res_export_files(HIGH_RES_MOISTURE30_FILES)),
+    MOISTURE_AGGREGATION,
+)
+theta60_treatment_high_res = aggregate_moisture_by_treatment(
+    clean_high_res_moisture_matrix(read_high_res_export_files(HIGH_RES_MOISTURE60_FILES)),
+    MOISTURE_AGGREGATION,
+)
+
+common_moisture_treatments = sorted(set(theta30_treatment_high_res.columns).intersection(theta60_treatment_high_res.columns))
+preferred_treatment_order = ["000", "100", "200", "400", "FINE-200", "MIXED-200"]
+common_moisture_treatments = [
+    treatment for treatment in preferred_treatment_order
+    if treatment in common_moisture_treatments
+] + [
+    treatment for treatment in common_moisture_treatments
+    if treatment not in preferred_treatment_order
+]
+
+theta30_treatment_regular = pd.DataFrame({
+    treatment: regularize_moisture_state(
+        theta30_treatment_high_res[treatment],
+        time_grid,
+        TIME_STEP,
+        MAX_MOISTURE_INTERPOLATION_GAP_HOURS,
+    )
+    for treatment in common_moisture_treatments
+})
+theta60_treatment_regular = pd.DataFrame({
+    treatment: regularize_moisture_state(
+        theta60_treatment_high_res[treatment],
+        time_grid,
+        TIME_STEP,
+        MAX_MOISTURE_INTERPOLATION_GAP_HOURS,
+    )
+    for treatment in common_moisture_treatments
+})
+
+rain_events = detect_rain_events(rain_regular, RAIN_EVENT_THRESHOLD_MM, EVENT_DRY_GAP_HOURS)
+event_lags = calculate_event_lags(
+    rain_events,
+    {
+        "30 cm": theta30_treatment_regular,
+        "60 cm": theta60_treatment_regular,
+    },
+    time_step_hours,
+)
+
+event_lags["replicate_aggregation"] = MOISTURE_AGGREGATION
+event_lags["method"] = (
+    f"rain events >= {RAIN_EVENT_THRESHOLD_MM:g} mm; events merged across <= {EVENT_DRY_GAP_HOURS:g} h dry gaps; "
+    f"first response is smoothed theta above pre-event median by max({EVENT_MIN_RESPONSE_PCT:g} percentage points, "
+    f"{EVENT_NOISE_MULTIPLIER:g} * pre-event standard deviation)"
+)
+event_summary_by_treatment_depth, event_summary_by_event = summarize_event_lags(event_lags)
+event_summary_by_treatment_depth["lag_days"] = event_summary_by_treatment_depth["median_first_response_lag_days"]
+event_summary_by_treatment_depth["process"] = "Rain to soil moisture threshold response"
+event_summary_by_treatment_depth["replicate_aggregation"] = MOISTURE_AGGREGATION
+event_summary_by_treatment_depth["method"] = event_lags["method"].iloc[0] if not event_lags.empty else ""
+
+rain_events.to_csv(os.path.join(FIG_DIR, "hydrologic_rain_events_2022_2024.csv"), index=False)
+event_lags.to_csv(os.path.join(FIG_DIR, "hydrologic_event_lags_by_treatment_depth.csv"), index=False)
+event_summary_by_event.to_csv(os.path.join(FIG_DIR, "hydrologic_event_lag_summary_by_event.csv"), index=False)
+event_summary_by_treatment_depth.to_csv(os.path.join(FIG_DIR, "hydrologic_event_lag_summary_by_treatment_depth.csv"), index=False)
+event_summary_by_treatment_depth.to_csv(os.path.join(FIG_DIR, "high_resolution_hydrologic_lags_by_treatment.csv"), index=False)
+
+fig, ax = plt.subplots(figsize=(7.1, 3.8), dpi=180)
+x = np.arange(len(common_moisture_treatments))
+depth_labels = ["30 cm", "60 cm"]
+event_lag_lookup = event_summary_by_treatment_depth.set_index(["treatment", "depth"])
+publication_lag_by_depth = event_summary_by_treatment_depth.groupby("depth")["median_first_response_lag_days"].median()
+publication_lag_60 = publication_lag_by_depth.get("60 cm", np.nan)
+max_treatment_lag = event_summary_by_treatment_depth["q75_first_response_lag_days"].max(skipna=True)
+if pd.isna(max_treatment_lag):
+    max_treatment_lag = event_summary_by_treatment_depth["median_first_response_lag_days"].max(skipna=True)
+if pd.isna(max_treatment_lag):
+    max_treatment_lag = 1.0
+depth_offsets = {"30 cm": -0.14, "60 cm": 0.14}
+depth_markers = {"30 cm": "o", "60 cm": "s"}
+
+for i, depth in enumerate(depth_labels):
+    medians = [
+        event_lag_lookup.loc[(treatment, depth), "median_first_response_lag_days"]
+        if (treatment, depth) in event_lag_lookup.index
+        else np.nan
+        for treatment in common_moisture_treatments
+    ]
+    q25 = [
+        event_lag_lookup.loc[(treatment, depth), "q25_first_response_lag_days"]
+        if (treatment, depth) in event_lag_lookup.index
+        else np.nan
+        for treatment in common_moisture_treatments
+    ]
+    q75 = [
+        event_lag_lookup.loc[(treatment, depth), "q75_first_response_lag_days"]
+        if (treatment, depth) in event_lag_lookup.index
+        else np.nan
+        for treatment in common_moisture_treatments
+    ]
+    responding_events = [
+        event_lag_lookup.loc[(treatment, depth), "responding_events"]
+        if (treatment, depth) in event_lag_lookup.index
+        else np.nan
+        for treatment in common_moisture_treatments
+    ]
+    eligible_events = [
+        event_lag_lookup.loc[(treatment, depth), "eligible_events"]
+        if (treatment, depth) in event_lag_lookup.index
+        else np.nan
+        for treatment in common_moisture_treatments
+    ]
+    medians = np.array(medians, dtype=float)
+    q25 = np.array(q25, dtype=float)
+    q75 = np.array(q75, dtype=float)
+    yerr = np.vstack([medians - q25, q75 - medians])
+    positions = x + depth_offsets[depth]
+
+    ax.errorbar(
+        positions,
+        medians,
+        yerr=yerr,
+        fmt=depth_markers[depth],
+        ms=6.2,
+        mfc=hydro_colors[i],
+        mec="black",
+        mew=0.75,
+        color=hydro_colors[i],
+        ecolor=hydro_colors[i],
+        elinewidth=1.25,
+        capsize=3,
+        lw=0,
+        label=depth,
+    )
+
+    for xpos, lag, upper, responding, eligible in zip(positions, medians, q75, responding_events, eligible_events):
+        if pd.notna(lag):
+            ax.text(
+                xpos,
+                upper + max(0.06, 0.03 * max_treatment_lag),
+                f"{int(responding)}/{int(eligible)}",
+                ha="center",
+                va="bottom",
+                fontsize=6.2,
+            )
+
+ax.axhline(
+    minimum_resolvable_lag_days,
+    color="0.25",
+    lw=0.9,
+    ls=":",
+    label=f"Resolution = {minimum_resolvable_lag_days:.2g} d",
+)
+if pd.notna(publication_lag_60):
+    ax.axhline(
+        publication_lag_60,
+        color=hydro_colors[1],
+        lw=1.3,
+        ls="--",
+        label=f"60 cm median = {publication_lag_60:.1f} d",
+    )
+    ax.text(
+        0.985,
+        publication_lag_60 + max(0.08, 0.025 * max_treatment_lag),
+        f"{publication_lag_60:.1f} d",
+        transform=ax.get_yaxis_transform(),
+        ha="right",
+        va="bottom",
+        color=hydro_colors[1],
+        fontsize=8.5,
+        fontweight="bold",
+    )
+ax.set_xticks(x)
+ax.set_xticklabels(common_moisture_treatments)
+ax.set_ylabel("First-response lag [days]", fontsize=10)
+ax.set_xlabel("Moisture treatment", fontsize=10)
+ax.set_title("Event-based wetting-response lag", fontsize=11, pad=7)
+ax.set_ylim(0, max(0.75, 1.28 * max(max_treatment_lag, publication_lag_60)))
+ax.grid(axis="y", alpha=0.25)
+ax.tick_params(direction="in", top=True, right=True, labelsize=8.5)
+ax.legend(frameon=False, ncol=4, loc="upper left", fontsize=8, handlelength=1.6, columnspacing=1.0)
+plt.tight_layout()
+save_figure(fig, "high_resolution_hydrologic_lag_times_by_treatment_accessible")
+save_figure(fig, "hydrologic_event_lag_publication")
+plt.show()
+
+fig, ax = plt.subplots(figsize=(8.0, 4.3), dpi=150)
+for i, depth in enumerate(depth_labels):
+    d = event_summary_by_event[event_summary_by_event["depth"] == depth].copy()
+    if d.empty:
+        continue
+    marker = "o" if depth == "30 cm" else "s"
+    ax.scatter(
+        d["rain_start"],
+        d["median_first_response_lag_days"],
+        s=58,
+        color=hydro_colors[i],
+        edgecolor="black",
+        linewidth=0.45,
+        marker=marker,
+        alpha=0.85,
+        label=depth,
+    )
+
+ax.axhline(
+    minimum_resolvable_lag_days,
+    color="0.25",
+    lw=0.9,
+    ls=":",
+    label=f"Resolution = {minimum_resolvable_lag_days:.2g} d",
+)
+ax.set_ylabel("Median first-response lag [days]")
+ax.set_xlabel("Rain-event start date")
+ax.set_title("Event-wise hydrologic wetting-response lag")
+ax.grid(axis="both", alpha=0.25)
+ax.xaxis.set_major_locator(mdates.MonthLocator(interval=4))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+ax.legend(frameon=False, loc="upper left")
+plt.tight_layout()
+save_figure(fig, "hydrologic_event_lag_times_by_event_accessible")
+plt.show()
+
 fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=150)
-ax.plot(lag30_days, corr30, color="#0072B2", lw=1.8, label="Rain -> 30 cm")
-ax.plot(lag60_days, corr60, color="#D55E00", lw=1.8, label="Rain -> 60 cm")
-ax.plot(lag3060_days, corr3060, color="#009E73", lw=1.8, label="30 -> 60 cm")
-ax.axvline(best30, color="#0072B2", lw=0.8, ls=":")
-ax.axvline(best60, color="#D55E00", lw=0.8, ls=":")
-ax.axvline(best3060, color="#009E73", lw=0.8, ls=":")
+ax.plot(lag30_days, corr30, color=hydro_colors[0], lw=1.9, ls="-", marker="o", markevery=8, ms=3.4, label="Rain -> 30 cm")
+ax.plot(lag60_days, corr60, color=hydro_colors[1], lw=1.9, ls="--", marker="s", markevery=8, ms=3.2, label="Rain -> 60 cm")
+ax.plot(lag3060_days, corr3060, color=hydro_colors[2], lw=1.9, ls="-.", marker="^", markevery=8, ms=3.4, label="30 -> 60 cm")
+ax.axvline(best30, color=hydro_colors[0], lw=1.0, ls=":")
+ax.axvline(direct_best60, color=hydro_colors[1], lw=1.0, ls=":")
+ax.axvline(best60, color=hydro_colors[1], lw=1.0, ls="--")
+ax.axvline(best3060, color=hydro_colors[2], lw=1.0, ls=":")
 ax.set_xlabel("Lag [days]")
 ax.set_ylabel("Correlation")
 ax.set_title("Hydrologic wetting-response lag correlations")
@@ -387,13 +981,13 @@ for variable, label, normalized_name in [
 
     d[normalized_name] = d[variable] / d["Volume in l"]
     daily = d.groupby("date")[normalized_name].median().sort_index()
-    baseline = daily[daily.index <= daily.index.min() + pd.Timedelta(days=60)]
+    baseline = daily[daily.index <= daily.index.min() + pd.Timedelta(days=CHEMICAL_BASELINE_WINDOW_DAYS)]
     if len(daily) < 3 or baseline.empty:
         continue
 
     baseline_median = baseline.median()
     baseline_mad = (baseline - baseline_median).abs().median()
-    threshold = baseline_median + max(3 * 1.4826 * baseline_mad, 0.10 * abs(baseline_median), 1e-12)
+    threshold = baseline_median + max(CHEMICAL_THRESHOLD_ROBUST_SIGMA * 1.4826 * baseline_mad, 0.10 * abs(baseline_median), 1e-12)
     hits = daily[daily >= threshold]
     response_date = pd.NaT if hits.empty else hits.index[0]
     response_delay_days = np.nan if pd.isna(response_date) else (response_date - daily.index.min()).total_seconds() / 86400
@@ -404,7 +998,7 @@ for variable, label, normalized_name in [
         "response_date": response_date,
         "baseline_median_mmol_per_l": baseline_median,
         "threshold_mmol_per_l": threshold,
-        "method": "median concentration above robust baseline threshold",
+        "method": f"median concentration above {CHEMICAL_THRESHOLD_ROBUST_SIGMA:g}-sigma robust baseline threshold",
     })
 
 chemical_responses = pd.DataFrame(chemical_responses)
@@ -418,8 +1012,13 @@ response_compare = pd.concat([
 response_compare.to_csv(os.path.join(FIG_DIR, "water_ca_mg_hco3_response_comparison.csv"), index=False)
 
 fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=150)
-colors = ["#0072B2", "#009E73", "#D55E00", "#CC79A7"]
-ax.bar(response_compare["process"], response_compare["days"], color=colors[:len(response_compare)])
+response_compare_plot = response_compare.dropna(subset=["days"]).copy()
+response_compare_plot = response_compare_plot[response_compare_plot["days"] > 0]
+bar_colors = response_compare_plot["quantity"].map({
+    "hydrologic lag": "#0072B2",
+    "chemical threshold response": "#D55E00",
+}).fillna("0.4")
+ax.bar(response_compare_plot["process"], response_compare_plot["days"], color=bar_colors)
 ax.set_yscale("log")
 ax.set_ylabel("Days")
 ax.set_title("Hydrologic lag and chemical threshold-response timing")
@@ -434,3 +1033,23 @@ print(pd.DataFrame({"raw_rain_sum_on_grid": [rain_on_grid.sum()], "regularized_r
 print(hydrologic_lags)
 print(chemical_responses)
 print(response_compare)
+
+leachate["Ca_mol_L"] = leachate["Ca2+ mmol"] / leachate["Volume in l"] / 1000.0
+leachate["Mg_mol_L"] = leachate["Mg2+ mmol"] / leachate["Volume in l"] / 1000.0
+leachate["HCO3_mol_L"] = leachate["HCO3- mmol"] / leachate["Volume in l"] / 1000.0
+
+phi = theta60_regular.quantile(0.99)
+theta_r = theta60_regular.quantile(0.02)
+theta_L = theta60_regular.quantile(0.20)
+theta_R = theta60_regular.quantile(0.90)
+
+
+
+c_L = leachate["Ca_mol_L"].quantile(0.10)
+c_R = leachate["Ca_mol_L"].quantile(0.90)
+
+print('Porosity could be', phi)
+print('Residual theta_r could be', theta_r)
+print('\theta', theta_L,theta_R)
+print('Ca_mol_L', c_L,c_R)
+
