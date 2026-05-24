@@ -15,16 +15,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 15,
-    "axes.labelsize": 16,
-    "axes.titlesize": 16,
-    "xtick.labelsize": 13,
-    "ytick.labelsize": 13,
-    "legend.fontsize": 11,
-    "mathtext.fontset": "dejavuserif"
-})
+
 
 import matplotlib.dates as mdates
 
@@ -235,7 +226,7 @@ axes[3].legend(ncol=4, loc="upper right", frameon=True, fontsize=6)
 axes[3].grid(axis="y", alpha=0.2)
 
 for ax in axes:
-    ax.tick_params(direction="in", top=True, right=True, labelsize=10)
+    ax.tick_params(direction="in", top=True, right=True, labelsize=8)
     ax.spines["top"].set_visible(True)
     ax.spines["right"].set_visible(True)
 
@@ -1004,27 +995,25 @@ for variable, label, normalized_name in [
 chemical_responses = pd.DataFrame(chemical_responses)
 chemical_responses.to_csv(os.path.join(FIG_DIR, "chemical_species_threshold_responses.csv"), index=False)
 
-response_compare = pd.concat([
-    pd.DataFrame({"process": ["Water at 60 cm"], "days": [best60], "quantity": ["hydrologic lag"]}),
-    chemical_responses.rename(columns={"response_delay_days_from_first_sample": "days"})[["process", "days"]].assign(quantity="chemical threshold response"),
-], ignore_index=True)
+response_compare = chemical_responses.rename(
+    columns={"response_delay_days_from_first_sample": "days"}
+)[["process", "days"]].assign(quantity="chemical threshold response")
 
-response_compare.to_csv(os.path.join(FIG_DIR, "water_ca_mg_hco3_response_comparison.csv"), index=False)
+response_compare.to_csv(os.path.join(FIG_DIR, "chemical_threshold_response_comparison.csv"), index=False)
 
 fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=150)
 response_compare_plot = response_compare.dropna(subset=["days"]).copy()
 response_compare_plot = response_compare_plot[response_compare_plot["days"] > 0]
 bar_colors = response_compare_plot["quantity"].map({
-    "hydrologic lag": "#0072B2",
     "chemical threshold response": "#D55E00",
 }).fillna("0.4")
 ax.bar(response_compare_plot["process"], response_compare_plot["days"], color=bar_colors)
 ax.set_yscale("log")
 ax.set_ylabel("Days")
-ax.set_title("Hydrologic lag and chemical threshold-response timing")
+ax.set_title("Chemical threshold-response timing")
 ax.grid(axis="y", alpha=0.25)
 plt.tight_layout()
-save_figure(fig, "water_ca_mg_hco3_response_comparison")
+save_figure(fig, "chemical_threshold_response_comparison")
 plt.show()
 
 print("Rain mass check [mm]:")
@@ -1053,3 +1042,291 @@ print('Residual theta_r could be', theta_r)
 print('\theta', theta_L,theta_R)
 print('Ca_mol_L', c_L,c_R)
 
+
+# Chemical-only version of the treatment response-lag summary plot.
+# This reproduces the treatment lag summary without the hydrologic moisture bars.
+CHEMICAL_LAG_SUMMARY_FILE = os.path.join(FIG_DIR, "lag_summary_2022_2024_mean_all_sensors.csv")
+
+if os.path.exists(CHEMICAL_LAG_SUMMARY_FILE):
+    chemical_lag_summary = pd.read_csv(CHEMICAL_LAG_SUMMARY_FILE, dtype={"treatment": str})
+    chemical_lag_summary = chemical_lag_summary[
+        chemical_lag_summary["treatment"].isin(SELECTED_TREATMENTS)
+    ].copy()
+    chemical_lag_summary["treatment"] = pd.Categorical(
+        chemical_lag_summary["treatment"],
+        categories=SELECTED_TREATMENTS,
+        ordered=True,
+    )
+    chemical_lag_summary = chemical_lag_summary.sort_values("treatment")
+
+    chemical_lag_columns = {
+        "lag_rain_to_hco3_days": r"$\mathrm{HCO_3^-}$",
+        "lag_rain_to_ca_days": r"$\mathrm{Ca^{2+}}$",
+        "lag_rain_to_mg_days": r"$\mathrm{Mg^{2+}}$",
+    }
+    chemical_lag_colors = ["#009E73", "#CC79A7", "0.55"]
+    chemical_lag_hatches = ["", "///", "\\\\\\"]
+
+    chemical_only_lags = chemical_lag_summary[
+        ["treatment"] + list(chemical_lag_columns)
+    ].copy()
+    chemical_only_lags.to_csv(
+        os.path.join(FIG_DIR, "chemical_response_lag_summary_2022_2024.csv"),
+        index=False,
+    )
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.6), dpi=160)
+    x = np.arange(len(chemical_lag_summary))
+    bar_width = 0.24
+
+    for i, (column, label) in enumerate(chemical_lag_columns.items()):
+        values = chemical_lag_summary[column].to_numpy(dtype=float)
+        bars = ax.bar(
+            x + (i - 1) * bar_width,
+            values,
+            width=bar_width,
+            color=chemical_lag_colors[i],
+            edgecolor="black",
+            linewidth=0.6,
+            hatch=chemical_lag_hatches[i],
+            label=label,
+        )
+        for bar, value in zip(bars, values):
+            if pd.notna(value):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value + 2.5,
+                    f"{value:.0f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(chemical_lag_summary["treatment"].astype(str))
+    ax.set_xlabel("Treatment")
+    ax.set_ylabel("Median lag after rain event [days]")
+    ax.set_title("Chemical response lags, 2022--2024")
+    ax.grid(axis="y", alpha=0.25)
+    ax.tick_params(direction="in", top=True, right=True)
+    ax.legend(frameon=True, ncol=3, loc="upper left")
+    ax.set_ylim(0, max(10, 1.15 * chemical_lag_summary[list(chemical_lag_columns)].max(skipna=True).max()))
+    plt.tight_layout()
+    save_figure(fig, "chemical_response_lag_summary_2022_2024")
+    plt.show()
+else:
+    print(f"Skipping chemical-only lag summary plot because {CHEMICAL_LAG_SUMMARY_FILE} was not found.")
+
+
+# Event-based hydrologic wetting-response lag histogram.
+# Uses only rain events with a detected soil-moisture threshold response.
+HYDROLOGIC_EVENT_LAGS_FILE = os.path.join(FIG_DIR, "hydrologic_event_lags_by_treatment_depth.csv")
+
+if "event_lags" in globals():
+    hydrologic_event_lags_for_hist = event_lags.copy()
+elif os.path.exists(HYDROLOGIC_EVENT_LAGS_FILE):
+    hydrologic_event_lags_for_hist = pd.read_csv(HYDROLOGIC_EVENT_LAGS_FILE)
+else:
+    hydrologic_event_lags_for_hist = pd.DataFrame()
+
+if not hydrologic_event_lags_for_hist.empty:
+    hydrologic_event_lags_for_hist = hydrologic_event_lags_for_hist[
+        hydrologic_event_lags_for_hist["response_class"] == "threshold response"
+    ].copy()
+    hydrologic_event_lags_for_hist = hydrologic_event_lags_for_hist.dropna(
+        subset=["first_response_lag_days_from_start", "depth"]
+    )
+
+if not hydrologic_event_lags_for_hist.empty:
+    hist_bins = np.arange(0, EVENT_SEARCH_WINDOW_DAYS + 1.0, 1.0)
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4), dpi=170, sharex=True, sharey=True)
+
+    for ax, depth, color in zip(axes, ["30 cm", "60 cm"], hydro_colors[:2]):
+        d = hydrologic_event_lags_for_hist[
+            hydrologic_event_lags_for_hist["depth"] == depth
+        ]["first_response_lag_days_from_start"].dropna()
+
+        ax.hist(
+            d,
+            bins=hist_bins,
+            color=color,
+            edgecolor="black",
+            linewidth=0.7,
+            alpha=0.88,
+        )
+
+        if not d.empty:
+            median_lag = d.median()
+            ax.axvline(median_lag, color="black", lw=1.6, ls="--")
+            ax.text(
+                0.96,
+                0.92,
+                f"n = {len(d)}\nmedian = {median_lag:.1f} d",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 2.0},
+            )
+
+        ax.set_title(depth, fontsize=10)
+        ax.set_xlabel("First-response lag [days]")
+        ax.grid(axis="y", alpha=0.25)
+        ax.tick_params(direction="in", top=True, right=True)
+
+    axes[0].set_ylabel("Count")
+    fig.suptitle("Event-based hydrologic wetting-response lag distribution", fontsize=11)
+    fig.subplots_adjust(top=0.84, bottom=0.18, left=0.10, right=0.98, wspace=0.08)
+    save_figure(fig, "hydrologic_event_wetting_response_lag_histogram")
+    plt.show()
+else:
+    print("Skipping hydrologic lag histogram because no threshold-response event lags were found.")
+
+
+# Combined event-based hydrologic and chemical response-lag histogram figure.
+# Top row: hydrologic wetting-response lag distributions at 30 and 60 cm.
+# Bottom row: chemical response-lag bar plot by treatment, kept in the same form as the standalone chemical figure.
+combined_hydro_lags = hydrologic_event_lags_for_hist.copy()
+combined_chemical_lags = pd.DataFrame()
+
+if os.path.exists(CHEMICAL_LAG_SUMMARY_FILE):
+    combined_chemical_lag_summary = pd.read_csv(CHEMICAL_LAG_SUMMARY_FILE, dtype={"treatment": str})
+    combined_chemical_lag_summary = combined_chemical_lag_summary[
+        combined_chemical_lag_summary["treatment"].isin(SELECTED_TREATMENTS)
+    ].copy()
+    combined_chemical_lag_summary["treatment"] = pd.Categorical(
+        combined_chemical_lag_summary["treatment"],
+        categories=SELECTED_TREATMENTS,
+        ordered=True,
+    )
+    combined_chemical_lag_summary = combined_chemical_lag_summary.sort_values("treatment")
+    combined_chemical_lags = combined_chemical_lag_summary[
+        ["lag_rain_to_hco3_days", "lag_rain_to_ca_days", "lag_rain_to_mg_days"]
+    ].rename(columns={
+        "lag_rain_to_hco3_days": r"$\mathrm{HCO_3^-}$",
+        "lag_rain_to_ca_days": r"$\mathrm{Ca^{2+}}$",
+        "lag_rain_to_mg_days": r"$\mathrm{Mg^{2+}}$",
+    })
+
+if not combined_hydro_lags.empty and not combined_chemical_lags.empty:
+    fig = plt.figure(figsize=(7.4, 6.1), dpi=170)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.05], hspace=0.38, wspace=0.15)
+    ax30 = fig.add_subplot(gs[0, 0])
+    ax60 = fig.add_subplot(gs[0, 1], sharey=ax30)
+    axchem = fig.add_subplot(gs[1, :])
+
+    for ax, depth, color, panel_label in [
+        (ax30, "30 cm", hydro_colors[0], "(a)"),
+        (ax60, "60 cm", hydro_colors[1], "(b)"),
+    ]:
+        d = combined_hydro_lags[
+            combined_hydro_lags["depth"] == depth
+        ]["first_response_lag_days_from_start"].dropna()
+        ax.hist(
+            d,
+            bins=np.arange(0, EVENT_SEARCH_WINDOW_DAYS + 1.0, 1.0),
+            color=color,
+            edgecolor="black",
+            linewidth=0.7,
+            alpha=0.88,
+        )
+        if not d.empty:
+            median_lag = d.median()
+            ax.axvline(median_lag, color="black", lw=1.4, ls="--")
+            ax.text(
+                0.96,
+                0.90,
+                f"n = {len(d)}\nmedian = {median_lag:.1f} d",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=7.5,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 2.0},
+            )
+        ax.text(
+            0.03,
+            0.92,
+            panel_label,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.80, "pad": 1.2},
+        )
+        ax.set_title(depth, fontsize=10)
+        ax.set_xlabel("Hydrologic lag [days]")
+        ax.grid(axis="y", alpha=0.25)
+        ax.tick_params(direction="in", top=True, right=True, labelsize=8.5)
+
+    ax30.set_ylabel("Count")
+    plt.setp(ax60.get_yticklabels(), visible=False)
+
+    combined_chemical_lag_columns = {
+        "lag_rain_to_hco3_days": r"$\mathrm{HCO_3^-}$",
+        "lag_rain_to_ca_days": r"$\mathrm{Ca^{2+}}$",
+        "lag_rain_to_mg_days": r"$\mathrm{Mg^{2+}}$",
+    }
+    combined_chemical_lag_colors = ["#009E73", "#CC79A7", "0.55"]
+    combined_chemical_lag_hatches = ["", "///", "\\\\\\"]
+    x_chemical = np.arange(len(combined_chemical_lag_summary))
+    chemical_bar_width = 0.24
+
+    for i, (column, label) in enumerate(combined_chemical_lag_columns.items()):
+        values = combined_chemical_lag_summary[column].to_numpy(dtype=float)
+        bars = axchem.bar(
+            x_chemical + (i - 1) * chemical_bar_width,
+            values,
+            width=chemical_bar_width,
+            color=combined_chemical_lag_colors[i],
+            edgecolor="black",
+            linewidth=0.6,
+            hatch=combined_chemical_lag_hatches[i],
+            label=label,
+        )
+        for bar, value in zip(bars, values):
+            if pd.notna(value):
+                axchem.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value + 2.5,
+                    f"{value:.0f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+
+    axchem.text(
+        -0.055,
+        1.02,
+        "(c)",
+        transform=axchem.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=10,
+        fontweight="bold",
+    )
+    axchem.set_xticks(x_chemical)
+    axchem.set_xticklabels(combined_chemical_lag_summary["treatment"].astype(str))
+    axchem.set_xlabel("Treatment")
+    axchem.set_ylabel("Median lag after rain [days]")
+    axchem.set_title("Chemical response lags, 2022--2024", fontsize=10)
+    axchem.grid(axis="y", alpha=0.25)
+    axchem.tick_params(direction="in", top=True, right=True, labelsize=8.5)
+    axchem.legend(frameon=True, ncol=3, loc="upper left", fontsize=8)
+    axchem.set_ylim(
+        0,
+        max(
+            10,
+            1.15 * combined_chemical_lag_summary[
+                list(combined_chemical_lag_columns)
+            ].max(skipna=True).max(),
+        ),
+    )
+
+    fig.suptitle("Event-based hydrologic lag distributions and chemical response lags", fontsize=11, y=0.98)
+    save_figure(fig, "combined_hydrologic_chemical_lag_histograms")
+    plt.show()
+else:
+    print("Skipping combined lag histogram because hydrologic or chemical lag data were not available.")
